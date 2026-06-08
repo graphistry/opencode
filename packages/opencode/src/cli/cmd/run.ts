@@ -762,7 +762,15 @@ export const RunCommand = effectCmd({
 
         if (!args.interactive) {
           const events = await client.event.subscribe()
-          loop(client, events).catch((e) => {
+          // Drain the event stream until the session goes idle. This promise must
+          // be awaited before returning: the request below (command/prompt) can
+          // resolve a beat before the terminal `message.part.updated` (finalized
+          // text part with `time.end`), `step-finish`, and `session.status: idle`
+          // events are delivered to this subscription. Returning early tears down
+          // the in-process server and its SSE stream mid-flush, silently dropping
+          // the assistant's answer (empty output). Awaiting guarantees the loop
+          // sees the idle status and renders the final text.
+          const drained = loop(client, events).catch((e) => {
             console.error(e)
             process.exit(1)
           })
@@ -779,7 +787,9 @@ export const RunCommand = effectCmd({
             if (result.error) {
               if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
               process.exitCode = 1
+              return
             }
+            await drained
             return
           }
 
@@ -794,7 +804,9 @@ export const RunCommand = effectCmd({
           if (result.error) {
             if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
             process.exitCode = 1
+            return
           }
+          await drained
           return
         }
 
