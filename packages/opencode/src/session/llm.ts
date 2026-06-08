@@ -5,7 +5,7 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Log } from "@opencode-ai/core/util/log"
 import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
-import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import { simulateStreamingMiddleware, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
@@ -275,6 +275,15 @@ const live: Layer.Layer<
           "llm.model": input.model.id,
         }),
       )
+      // Opt out of streaming per-model or per-provider with `options.streaming: false`.
+      // Some Bedrock models (e.g. Llama 4) reject tool use over the streaming
+      // /converse-stream endpoint ("This model doesn't support tool use in streaming
+      // mode"), and some OpenAI-compatible backends corrupt or reject streamed output.
+      // simulateStreamingMiddleware makes the model call doGenerate (stream:false on the
+      // wire, e.g. Bedrock /converse) and re-emits a simulated stream, so the rest of the
+      // pipeline is unchanged. Model-level wins over provider-level.
+      const disableStreaming = (input.model.options?.["streaming"] ?? item.options?.["streaming"]) === false
+
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
@@ -326,7 +335,10 @@ const live: Layer.Layer<
               {
                 specificationVersion: "v3" as const,
                 async transformParams(args) {
-                  if (args.type === "stream") {
+                  // When streaming is disabled the model below is wrapped with
+                  // simulateStreamingMiddleware, which calls doGenerate — so the prompt
+                  // transform must run for "generate" too, not only "stream".
+                  if (args.type === "stream" || disableStreaming) {
                     // @ts-expect-error
                     args.params.prompt = ProviderTransform.message(
                       args.params.prompt,
@@ -337,6 +349,7 @@ const live: Layer.Layer<
                   return args.params
                 },
               },
+              ...(disableStreaming ? [simulateStreamingMiddleware()] : []),
             ],
           }),
           experimental_telemetry: {
