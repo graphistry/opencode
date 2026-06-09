@@ -18,7 +18,13 @@
 // it only fires for models flagged as needing it, only touches text content,
 // and only emits calls whose tool name is actually offered for the request.
 
-import type { LanguageModelV3Content, LanguageModelV3FunctionTool } from "@ai-sdk/provider"
+import type {
+  LanguageModelV3Content,
+  LanguageModelV3FunctionTool,
+  LanguageModelV3Message,
+  LanguageModelV3Prompt,
+  LanguageModelV3ToolResultOutput,
+} from "@ai-sdk/provider"
 
 export type OfferedTool = {
   readonly name: string
@@ -310,6 +316,123 @@ export function rewriteContent(
   }
 
   return { content: out, toolCalls }
+}
+
+// Re-serialize a prior tool call the Gemma way: a ```tool_code``` block holding
+// the bare command (for shell tools) or a `name(kwargs)` Python call. This is the
+// inverse of parseToolCodeBlock above — the model originally emitted exactly this
+// shape, so replaying it as text keeps the transcript in Gemma's own idiom.
+function renderToolCallAsText(toolName: string, input: unknown): string {
+  const obj = input && typeof input === "object" ? (input as Record<string, unknown>) : {}
+  const bare = BARE_ARG_BY_TOOL[toolName.toLowerCase()]
+  const command = bare ? obj[bare] : undefined
+  if (typeof command === "string") {
+    return "```tool_code\n" + command + "\n```"
+  }
+  // Non-shell tool: render as a Python-style call so a round-trip through
+  // parseToolCodeBlock would recover the same arguments.
+  const args = Object.entries(obj)
+    .filter(([k]) => k !== "description")
+    .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+    .join(", ")
+  return "```tool_code\n" + `${toolName}(${args})` + "\n```"
+}
+
+// Flatten an ai-sdk tool-result output into the plain text Gemma understands.
+function renderToolOutputAsText(output: LanguageModelV3ToolResultOutput): string {
+  switch (output.type) {
+    case "text":
+    case "error-text":
+      return output.value
+    case "json":
+    case "error-json":
+      return JSON.stringify(output.value)
+    case "execution-denied":
+      return output.reason ?? "Tool execution denied."
+    case "content":
+      return output.value
+        .map((part) => (part.type === "text" ? part.text : `[${part.type}]`))
+        .join("\n")
+    default:
+      return ""
+  }
+}
+
+// Rewrite a replayed V3 prompt so a Gemma turn never carries native tool blocks.
+//
+// Gemma has no native tool channel (see header). On Bedrock the request still
+// converts cleanly to Converse — a recovered tool-call becomes an `assistant`
+// `toolUse` block and its result a `user` `toolResult` block — but the Gemma
+// serverless endpoint re-templates Converse into its OWN chat format, where a
+// `toolUse`-only assistant turn renders to no text and collapses. The surviving
+// turns then read user/user, so Gemma's chat template rejects the request with
+// "Conversation roles must alternate user/assistant/user/assistant/...".
+//
+// The fix mirrors how Gemma emits calls in the first place: render each prior
+// tool-call as assistant TEXT holding a ```tool_code``` block, and each tool
+// result as USER text holding a ```tool_output``` block. Every turn then carries
+// real text and the user/assistant alternation holds. Consecutive same-role
+// messages produced by this rewrite (e.g. an assistant text part next to a
+// rewritten tool-call) are merged so the alternation is exact. Narrow by design:
+// only the assistant tool-call and tool-result parts change; text, file, system,
+// and reasoning parts pass through untouched. Gated by the caller (isGemma +
+// OPENCODE_DISABLE_GEMMA_TOOLCODE off).
+export function rewritePromptForGemma(prompt: LanguageModelV3Prompt): LanguageModelV3Prompt {
+  const lowered: LanguageModelV3Message[] = []
+  for (const msg of prompt) {
+    if (msg.role === "assistant") {
+      const parts: Array<{ type: "text"; text: string }> = []
+      for (const part of msg.content) {
+        switch (part.type) {
+          case "tool-call":
+            parts.push({ type: "text", text: renderToolCallAsText(part.toolName, part.input) })
+            break
+          case "text":
+          case "reasoning":
+            if (part.text.trim()) parts.push({ type: "text", text: part.text })
+            break
+          // Drop tool-result parts that occasionally ride on assistant messages;
+          // their content is replayed via the dedicated tool message below.
+          default:
+            break
+        }
+      }
+      lowered.push({ role: "assistant", content: parts.length ? parts : [{ type: "text", text: "" }] })
+      continue
+    }
+    if (msg.role === "tool") {
+      const text = msg.content
+        .map((part) => (part.type === "tool-result" ? renderToolOutputAsText(part.output) : ""))
+        .filter(Boolean)
+        .join("\n")
+      // A tool result is the user's turn for Gemma (it follows an assistant call).
+      lowered.push({ role: "user", content: [{ type: "text", text: "```tool_output\n" + text + "\n```" }] })
+      continue
+    }
+    lowered.push(msg)
+  }
+  return mergeAdjacentRoles(lowered)
+}
+
+// Merge consecutive messages that share a role (other than system) into one, so
+// the lowering above never produces two assistant or two user turns in a row.
+function mergeAdjacentRoles(msgs: LanguageModelV3Message[]): LanguageModelV3Message[] {
+  const out: LanguageModelV3Message[] = []
+  for (const msg of msgs) {
+    const prev = out[out.length - 1]
+    if (
+      prev &&
+      prev.role === msg.role &&
+      (msg.role === "user" || msg.role === "assistant") &&
+      Array.isArray(prev.content) &&
+      Array.isArray(msg.content)
+    ) {
+      ;(prev.content as unknown[]).push(...(msg.content as unknown[]))
+      continue
+    }
+    out.push(msg)
+  }
+  return out
 }
 
 export * as GemmaToolCode from "./gemma-tool-code"

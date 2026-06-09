@@ -368,6 +368,15 @@ const live: Layer.Layer<
                       prepared.messageTransformOptions,
                     )
                   }
+                  // Gemma has no native tool channel: replaying a prior tool-call
+                  // as a native toolUse/toolResult block makes the Gemma endpoint's
+                  // own chat template collapse the assistant turn and reject the
+                  // request with "Conversation roles must alternate ...". Re-render
+                  // that history as ```tool_code```/```tool_output``` text so turns
+                  // alternate. Same gating as the output-side recovery.
+                  if (gemmaToolCode) {
+                    args.params.prompt = GemmaToolCode.rewritePromptForGemma(args.params.prompt)
+                  }
                   return args.params
                 },
               },

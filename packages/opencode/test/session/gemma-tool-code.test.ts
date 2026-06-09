@@ -89,3 +89,85 @@ describe("GemmaToolCode.rewriteContent", () => {
     expect(out).toEqual(content)
   })
 })
+
+describe("GemmaToolCode.rewritePromptForGemma", () => {
+  // The exact turn-2 prompt shape captured from the Bedrock 400 repro.
+  const replayed = [
+    { role: "system" as const, content: "you are opencode" },
+    { role: "user" as const, content: [{ type: "text" as const, text: "run echo first then echo second" }] },
+    {
+      role: "assistant" as const,
+      content: [
+        {
+          type: "tool-call" as const,
+          toolCallId: "gemma_tc_1",
+          toolName: "bash",
+          input: { command: "echo first", description: "d" },
+        },
+      ],
+    },
+    {
+      role: "tool" as const,
+      content: [
+        {
+          type: "tool-result" as const,
+          toolCallId: "gemma_tc_1",
+          toolName: "bash",
+          output: { type: "text" as const, value: "first\n" },
+        },
+      ],
+    },
+  ]
+
+  test("renders prior tool-call as assistant tool_code text and result as user tool_output text", () => {
+    const out = GemmaToolCode.rewritePromptForGemma(replayed as any)
+    expect(out.map((m) => m.role)).toEqual(["system", "user", "assistant", "user"])
+    // No native tool blocks survive.
+    const types = out.flatMap((m) => (Array.isArray(m.content) ? m.content.map((p: any) => p.type) : ["string"]))
+    expect(types).not.toContain("tool-call")
+    expect(types).not.toContain("tool-result")
+    const assistant = out[2] as any
+    expect(assistant.content[0].text).toBe("```tool_code\necho first\n```")
+    const toolUser = out[3] as any
+    expect(toolUser.content[0].text).toBe("```tool_output\nfirst\n\n```")
+  })
+
+  test("roles strictly alternate user/assistant after the rewrite", () => {
+    const out = GemmaToolCode.rewritePromptForGemma(replayed as any)
+    const conv = out.filter((m) => m.role !== "system").map((m) => m.role)
+    expect(conv).toEqual(["user", "assistant", "user"])
+    for (let i = 1; i < conv.length; i++) expect(conv[i]).not.toBe(conv[i - 1])
+  })
+
+  test("a rewritten tool-call round-trips back through parseToolCodeBlock", () => {
+    const out = GemmaToolCode.rewritePromptForGemma(replayed as any)
+    const block = ((out[2] as any).content[0].text as string).replace(/```tool_code\n|\n```/g, "")
+    expect(GemmaToolCode.parseToolCodeBlock(block, offered)).toEqual([
+      { toolName: "bash", input: { command: "echo first", description: expect.any(String) } },
+    ])
+  })
+
+  test("merges an assistant text part with a following tool-call into one turn", () => {
+    const out = GemmaToolCode.rewritePromptForGemma([
+      { role: "user" as const, content: [{ type: "text" as const, text: "hi" }] },
+      {
+        role: "assistant" as const,
+        content: [
+          { type: "text" as const, text: "Running it." },
+          { type: "tool-call" as const, toolCallId: "x", toolName: "bash", input: { command: "ls" } },
+        ],
+      },
+    ] as any)
+    expect(out.map((m) => m.role)).toEqual(["user", "assistant"])
+    const assistant = out[1] as any
+    expect(assistant.content.map((p: any) => p.text)).toEqual(["Running it.", "```tool_code\nls\n```"])
+  })
+
+  test("plain conversations without tool history are left untouched", () => {
+    const plain = [
+      { role: "user" as const, content: [{ type: "text" as const, text: "hello" }] },
+      { role: "assistant" as const, content: [{ type: "text" as const, text: "hi there" }] },
+    ]
+    expect(GemmaToolCode.rewritePromptForGemma(plain as any)).toEqual(plain as any)
+  })
+})
