@@ -28,6 +28,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { GemmaToolCode } from "./llm/gemma-tool-code"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
@@ -282,7 +283,28 @@ const live: Layer.Layer<
       // simulateStreamingMiddleware makes the model call doGenerate (stream:false on the
       // wire, e.g. Bedrock /converse) and re-emits a simulated stream, so the rest of the
       // pipeline is unchanged. Model-level wins over provider-level.
-      const disableStreaming = (input.model.options?.["streaming"] ?? item.options?.["streaming"]) === false
+      // Gemma 3 has no native tool-use tokens. On Bedrock it accepts the Converse
+      // `toolConfig` but ignores it, emitting its intended call as a ```tool_code```
+      // text block instead — so the call is never executed (tool_use_count = 0). We
+      // recover those into real tool calls in a wrapGenerate middleware, which needs
+      // the non-streaming doGenerate path (the block only exists once text is whole),
+      // so force streaming off for Gemma. Opt out with options.streaming:true or
+      // OPENCODE_DISABLE_GEMMA_TOOLCODE=1.
+      const isGemma = /gemma/i.test(input.model.id) || /gemma/i.test(input.model.api.id)
+      const gemmaToolCode =
+        isGemma &&
+        Object.keys(prepared.tools).length > 0 &&
+        process.env["OPENCODE_DISABLE_GEMMA_TOOLCODE"] !== "1" &&
+        (input.model.options?.["streaming"] ?? item.options?.["streaming"]) !== true
+
+      const disableStreaming =
+        gemmaToolCode || (input.model.options?.["streaming"] ?? item.options?.["streaming"]) === false
+
+      const gemmaOfferedTools = gemmaToolCode
+        ? GemmaToolCode.offeredToolsFrom(
+            Object.keys(prepared.tools).map((name) => ({ type: "function" as const, name })),
+          )
+        : []
 
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
@@ -350,6 +372,35 @@ const live: Layer.Layer<
                 },
               },
               ...(disableStreaming ? [simulateStreamingMiddleware()] : []),
+              // Innermost: rewrite Gemma `tool_code` text blocks emitted by the
+              // raw model into native tool-call content, then simulateStreaming
+              // (outer) re-streams the rewritten result. Must wrap the real
+              // model's doGenerate, so it is last in the array.
+              ...(gemmaToolCode
+                ? [
+                    {
+                      specificationVersion: "v3" as const,
+                      async wrapGenerate({
+                        doGenerate,
+                      }: {
+                        doGenerate: () => PromiseLike<Awaited<ReturnType<typeof language.doGenerate>>>
+                      }) {
+                        const result = await doGenerate()
+                        const { content, toolCalls } = GemmaToolCode.rewriteContent(
+                          result.content,
+                          gemmaOfferedTools,
+                        )
+                        if (toolCalls === 0) return result
+                        l.info("gemma tool_code recovered", { toolCalls })
+                        return {
+                          ...result,
+                          content,
+                          finishReason: { ...result.finishReason, unified: "tool-calls" as const },
+                        }
+                      },
+                    },
+                  ]
+                : []),
             ],
           }),
           experimental_telemetry: {
