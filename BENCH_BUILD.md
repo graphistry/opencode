@@ -7,6 +7,25 @@ are reproducible. Record the build identity in every result (see Provenance belo
 
 ## Tags
 
+### bench-bedrock-v3
+- Upstream base: `anomalyco/opencode @ 07808be` (branch `dev`)
+- Patches (each a separate commit):
+  - `fix(cli): await event-drain loop in non-interactive run` → upstream `anomalyco/opencode#29132`/#31389
+  - `feat(bedrock): honor streaming:false for tool use ...`    → upstream `anomalyco/opencode#31357`
+  - `feat(bedrock): recover Gemma tool_code text blocks into native tool calls` (v2)
+  - `fix(bedrock): serialize Gemma tool history as text so multi-turn Converse roles alternate` (NEW in v3) —
+    Gemma has no native tool channel, so replaying a recovered tool-call as a native Converse `toolUse`/`toolResult`
+    block makes the Gemma serverless endpoint's chat template collapse the `toolUse`-only assistant turn, leaving
+    `user/user` and a 400 `"Conversation roles must alternate ..."` after the FIRST tool call. Adds
+    `GemmaToolCode.rewritePromptForGemma` (called from the Gemma `transformParams` path, same gating) which re-renders
+    prior tool-calls as assistant ` ```tool_code ` text and tool results as user ` ```tool_output ` text, then merges
+    adjacent same-role turns so alternation is exact. Gemma-gated; Claude/Nova/Llama/Nemotron untouched.
+- Toolchain: `bun 1.3.14`
+- Validated 2026-06-08/09 on real Bedrock: Gemma multi-turn 2-turn (`echo first`→`echo second`) and 4-command
+  (`alpha/bravo/charlie/delta`) runs complete with NO role-alternation 400 and all tool calls executed in order;
+  `typecheck` (tsgo --noEmit) exit 0; `gemma-tool-code.test.ts` 18/18 (12 + 6 new). Supersedes v2 for any
+  multi-turn tool task (v2 only works for a single tool call).
+
 ### bench-bedrock-v2
 - Upstream base: `anomalyco/opencode @ 07808be` (branch `dev`)
 - Patches (each a separate commit):
