@@ -7,6 +7,18 @@ are reproducible. Record the build identity in every result (see Provenance belo
 
 ## Tags
 
+### bench-bedrock-v2
+- Upstream base: `anomalyco/opencode @ 07808be` (branch `dev`)
+- Patches (each a separate commit):
+  - `fix(cli): await event-drain loop in non-interactive run` → upstream `anomalyco/opencode#29132`/#31389
+  - `feat(bedrock): honor streaming:false for tool use ...`    → upstream `anomalyco/opencode#31357`
+  - `feat(bedrock): recover Gemma tool_code text blocks into native tool calls` (NEW in v2) — Gemma 3 has
+    no native tool-use tokens; routes Gemma via non-streaming `doGenerate` + a `wrapGenerate` middleware that
+    parses ` ```tool_code ` blocks into native tool calls. Gemma-gated; Claude/Nova/Llama/Nemotron untouched.
+- Toolchain: `bun 1.3.14`
+- Validated 2026-06-08: Gemma tool_use_count 0→3/3 on real Bedrock; Sonnet/Nemotron native tool use intact;
+  `llm.test.ts` 26/26 + new `gemma-tool-code.test.ts`.
+
 ### bench-bedrock-v1
 - Upstream base: `anomalyco/opencode @ 07808be` (branch `dev`)
 - Patches (each a separate commit, attributable to an upstream PR):
